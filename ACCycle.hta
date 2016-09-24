@@ -1,0 +1,540 @@
+<html>
+<head>
+<title id=TitleBar>Air Conditioner Cycling </title>
+<HTA:APPLICATION 
+     ID="objACCycle"
+     APPLICATIONNAME="Air Conditioner Cycling"
+     SCROLL="auto"
+     SINGLEINSTANCE="yes"
+>
+</head>
+
+<SCRIPT LANGUAGE="VBScript">
+    Dim iTimerID
+    Dim iRunning      // is AC running?
+    Dim controlMode   // MODE_TEMP, MODE_TIME, MODE_MANUAL
+    Dim prevTempC        ' track the previous valid temperature, so 0 readings can be corrected
+    Dim debugLog         ' true - log all messages    false - just log turn on/off
+	
+    Const NORMAL_WINDOW = 1                 ' Constants for running DigiLogger Power Switch
+    Const DIGILOGGERPROG = "C:\Program Files (x86)\ACP Obs Control\Scripts\Brew\UU.W32.exe"
+    Const OnCommand = "192.168.1.40 admin:1552 8on"
+    Const OffCommand = "192.168.1.40 admin:1552 8off"
+    Const DEBUG_HAVE_PROG = True                    ' use on machine without DigiLogger (Vulcan)	
+    
+    Const MODE_TEMP = "TempMode"
+    Const MODE_TIME = "TimeMode"
+    Const MODE_MANUAL = "ManualMode"
+
+    Const TIME_MODE_INTERVAL = 60000        ' 60000 is every minute
+    Const MANUAL_MODE_INTERVAL = 60000        ' 60000 is every minute
+
+    Const ACTIVE_COLOR = "lightgreen"           
+    Const INACTIVE_COLOR = "lightgray"
+
+    CONST COMM_PORT = 6              ' Com port for Optec
+    Const CMD_MANUAL = "FMMODE"
+    Const CMD_MANUAL_RETURN = "!"
+    Const CMD_END = "FFMODE"
+    Const CMD_END_RETURN = "END"
+    Const CMD_GET_TEMP = "FTMPRO"
+
+    Const BOLTWOOD_DATA_FILE = "ClarityII_fmt.txt"         ' used to log temperature for input to WeatherDisplay
+    Dim comm
+
+    dim tempTimerID
+    dim timeTimerID
+    dim manualTimerID
+
+    dim objShell                ' used to run external programs
+
+    dim logFile
+
+    Sub Window_OnLoad
+        dim fso,tempLogName
+
+	Set objShell = CreateObject("Shell.Application")
+        ' create log file
+        set fso = CreateObject("Scripting.FileSystemObject")
+        tempLogName = fso.GetTempName
+        set logFile = fso.OpenTextFile(tempLogName,2,true)
+
+        prevTempC = -1
+        debugLog = true
+
+        SetACPower(False)
+        window.resizeTo 800,650
+        tempControlModeActivate (False)
+        timeControlModeActivate (False)
+        manualControlModeActivate (True)
+        document.GetElementByID("imgManualTimer").style.visibility = "hidden"
+        document.GetElementByID("imgTempTimer").style.visibility = "hidden"
+        document.GetElementByID("imgTimeTimer").style.visibility = "hidden"
+
+    End Sub
+
+    Sub Window_OnUnload
+        logFile.Close
+        set logFile = Nothing
+    End Sub
+
+    Sub WriteBoltwoodFile (degC)
+'       The fields mean:
+'       Heading Col’s Meaning
+'       Date 1-10 local date yyyy-mm-dd
+'       Time 12-22 local time hh:mm:ss.ss (24 hour clock)
+'       T 24 temperature units displayed and in this data, 'C' for Celsius or 'F' for Fahrenheit
+'       V 26 wind velocity units displayed and in this data, ‘K’ for km/hr or ‘M’ for mph or 'm' for m/s
+'       SkyT 28-33 sky-ambient temperature, 999. for saturated hot, -999. for saturated cold, or –998. for wet
+'       AmbT 35-40 ambient temperature
+'       SenT 41-47 sensor case temperature, 999. for saturated hot, -999. for saturated cold. Neither saturated condition should ever occur.
+'       Wind 49-54 wind speed or:
+'           -1. if still heating up,
+'           -2. if wet,
+'           -3. if the A/D from the wind probe is bad (firmware <V56 only) ,
+'           -4. if the probe is not heating (a failure condition),
+'           -5. if the A/D from the wind probe is low (shorted, a failure condition) 
+'           -6. if the A/D from the wind probe is high (no probe plugged in or a failure)
+'       Hum 56-58 relative humidity in %
+'       DewPt 60-65 dew point temperature
+'       Hea 67-69 heater setting in %
+'       R 71 rain flag, =0 for dry, =1 for rain in the last minute, =2 for rain right now
+'       W 73 wet flag, =0 for dry, =1 for wet in the last minute, =2 for wet right now
+'       Since 75-79 seconds since the last valid data
+'       Now() Day's 81-92 date/time given as the VB6 Now() function result (in days) when Clarity II last wrote this file
+'       c 94 cloud condition  
+'           0 - unknown
+'           1 - clear
+'           2 - cloudy
+'           3 - very cloudy
+'       w 96 wind condition 
+'           0 - unknown
+'           1 - Calm
+'           2 - windy
+'           3 - very windy
+'       r 98 rain condition 
+'           0 - unknown
+'           1 - dry
+'           2 - wet
+'           3 - very rain
+'       d 100 daylight condition 
+'           0 - unknown
+'           1 - dark
+'           2 - light
+'           3 - very light
+'       C 102 roof close, =0 not requested, =1 if roof close was requested on this cycle
+'       A 104 alert, =0 when not alerting, =1 when alerting 
+'
+        Dim boltFile, fso
+        Dim s, d
+        Dim myDay, myMonth
+
+        set fso = CreateObject("Scripting.FileSystemObject")
+        set boltFile = fso.OpenTextFile(BOLTWOOD_DATA_FILE,2,true)
+
+        d = CDate(Now())
+        ' watch for single digit month or day
+        myDay = Day(d)
+        if (myDay < 10) then myDay = "0" & myDay end if
+        myMonth = Month(d)
+        if (myMonth < 10) then myMonth = "0" & myMonth end if
+
+        s = Year(d) & "-" & myMonth & "-" & myDay & " " & FormatDateTime(d,4) &  ":00.00 C M " & FormatNumber(degC,1) & "   0     0       0      0   0      000 0 0 00002 000001.00000 0 0 0 0"
+        boltFile.WriteLine(s)
+
+        boltFile.Close
+        set boltFile = Nothing
+    End Sub
+
+
+    Sub SetACPower (turnOn)
+        if (turnOn) then
+	    stStr = "<img src='lightOn.png' width=32 height=32 />"
+            if (DEBUG_HAVE_PROG) then
+                objShell.ShellExecute DIGILOGGERPROG, OnCommand, , , NORMAL_WINDOW
+            end if
+	    iRunning = True
+	else
+            stStr = "<img src='lightOff.png' width=32 height=32 />"
+            if (DEBUG_HAVE_PROG) then
+		objShell.ShellExecute DIGILOGGERPROG, OffCommand, , , NORMAL_WINDOW
+            end if
+            iRunning = False
+	end if
+	StatusLight.InnerHTML = stStr
+    end sub
+	
+    Function GetCurrTempOptec()
+        dim rets
+        dim degC, degF
+
+        ' Open the Optec focuser, read the temperature, close the focuser
+        set comm = CreateObject ("MSCOMMLib.MSComm")
+        comm.CommPort = COMM_PORT
+        comm.Settings = "19200,N,8,1"
+        comm.InputLen = 0
+        on error resume next
+        comm.PortOpen = True
+        degC = 0
+        if (Err) then
+            LogMyMsg Err.Description, true
+        else
+            if (StartConversation() = True) then
+                ' read the temperature
+                rets = SendReceive (CMD_GET_TEMP)     ' rets is T=+nn.n
+                degC = CDbl(mid(rets,3,5)) 
+                if (degC = 0) then
+                   ' something wrong, prob error message. Use prev temp
+                   LogMyMsg "zero temp. ret is " & rets, debugLog
+                   degC = prevTempC
+                end if
+                ' Convert to F
+                prevTempC = degC
+                degF = degC * 9 / 5 + 32
+
+                ' Issue FFMODE to end communications
+                EndConversation()
+            end if
+            comm.PortOpen = False
+        end if        
+
+	currentTemp.InnerHTML = FormatNumber(degF,1)
+        if iRunning then msg = "ON" else msg = "OFF" end if
+        LogMyMsg Date & " " & Time & ": " & msg & " Current Temp is " & FormatNumber(degF,1), true
+        
+        ' Change title bar to reflect temp and state
+        document.title = "Air Conditioner Cycling " & msg & " " & FormatNumber(degF,1)
+
+        WriteBoltwoodFile degC
+        GetCurrTemp = degF
+    End Function
+	
+    Function GetCurrTemp()
+        dim degF
+
+
+        degF = 90
+	currentTemp.InnerHTML = FormatNumber(degF,1)
+        if iRunning then msg = "ON" else msg = "OFF" end if
+        LogMyMsg Date & " " & Time & ": " & msg & " Current Temp is " & FormatNumber(degF,1), true
+        
+        ' Change title bar to reflect temp and state
+        document.title = "Air Conditioner Cycling " & msg & " " & FormatNumber(degF,1)
+
+        GetCurrTemp = degF
+    End Function
+	
+    Function EndConversation()
+        Dim rets     ' return string
+        Dim ok
+        
+        'LogMyMsg ("EndConv ", debugLog)
+        rets = SendReceive (CMD_END)
+        ok = (mid(rets,1,len(CMD_END_RETURN)) = CMD_END_RETURN)
+        if (NOT ok) then
+            LogMyMsg "EndConversation: FFMODE failed " & rets, debugLog
+        end if
+        EndConversation = ok
+    End Function
+
+    Function StartConversation()
+        Dim rets     ' return string
+        Dim s
+        Dim loopcnt 
+
+        loopcnt = 1
+        rets = "xxxxxxxxxx"
+        do until (mid(rets,1,len(CMD_MANUAL_RETURN)) = CMD_MANUAL_RETURN)
+            s = "StartConv try " & CStr(loopcnt)
+            LogMyMsg s, debugLog
+            rets = SendReceive (CMD_MANUAL)
+            loopcnt = loopcnt + 1
+            if (loopcnt > 10) then
+               StartConversation = False
+               Exit Function
+            end if
+        loop
+        StartConversation = True
+    End Function
+
+    Function SendReceive(outmsg)
+        comm.Output = outmsg & Chr(10) & Chr(13)
+        LogMyMsg "  Sent string {" & outmsg & "}", debugLog
+        s = ""
+        count = 1
+        do while (len(s) < 3)
+            Sleep (500)
+            s = comm.input
+            count = count + 1
+            if (count > 60) then
+                s = "ERROR  "
+            end if
+            'LogMyMsg "  CheckErr string {" & s & "}", debugLog
+            'if (mid(s,1,4) = "ER=1") then
+            '    ' if ER=1, want to keep looking for the return string? 
+            '    ' Temp request seems to return the string after ER=1 return
+            '    LogMyMsg "Error 1 found " & s, debugLog
+            '    s = ""
+            'end if
+        loop
+        
+        s = mid(s,1,len(s)-2)
+        LogMyMsg "  Received string {" & s & "}", debugLog
+        SendReceive = s
+    End Function
+
+    Sub CheckTemp_Timer
+        document.GetElementByID("imgTempTimer").style.visibility = "visible"
+        ' timer callback for temp control
+	theTemp = GetCurrTemp
+		
+	lowTemp = CDbl(document.GetElementByID("txtLowerTemp").Value)
+	highTemp = CDbl(document.GetElementByID("txtUpperTemp").Value)
+		
+	chgStr = ""
+        if ((theTemp < lowTemp) and (iRunning = True)) then
+	    SetACPower (False)
+            chgStr = "  Turned off AC"
+	elseif ((theTemp > highTemp) and (iRunning = False)) then
+	    SetACPower (True)
+            chgStr = "  Turned ON AC"
+	end if
+
+        if (chgStr <> "") then		
+ 	    logStr = Date & " " & Time & ": " & theTemp & chgStr
+	    LogMyMsg logStr, false
+        end if
+        document.GetElementByID("imgTempTimer").style.visibility = "hidden"
+    End Sub
+
+    sub CheckTime_Timer
+        ' timer callback for time control
+        document.GetElementByID("imgTimeTimer").style.visibility = "visible"
+        
+        onTime = document.GetElementByID("txtTimeOn").Value
+	offTime = document.GetElementByID("txtTimeOff").Value
+        onSecs = Hour(onTime) * 60 + Minute(onTime) 
+        offSecs = Hour(offTime) * 60 + Minute(offTime) 
+        curTime = Time()
+        currentTime.innerHTML = curTime
+        curSecs = Hour(curTime) * 60 + Minute(curTime) 
+
+        ' Potentially, we have two possibilities
+        ' Normal situation, where start time < end time  (7AM to 2PM)
+        ' Reverse situation, where we want to run from 2PM to 7AM
+        if (onSecs < offSecs) then
+            normalMode = True
+        else
+            normalMode = false
+        end if
+
+        msg = Time & " no change" & onSecs & " " & curSecs & " " & OffSecs
+        if (((normalMode) and (curSecs <= offSecs) and (curSecs >= onSecs)) OR _
+            ((not normalMode) and (curSecs >= onSecs) and (curSecs >= offSecs))) then
+            ' needs to be on
+            msg = Time & " Needs on " & onSecs & " " & curSecs & " " & OffSecs
+            if (not iRunning) then
+                SetACPower (true)
+                msg = msg & "turned on"
+            end if
+        else
+            ' needs to be off
+            msg = Time & " Needs off " & onSecs & " " & curSecs & " " & OffSecs
+            if (iRunning) then
+                SetACPower (false)
+                msg = msg & "turned off"
+            end if
+        end if
+        theTemp = GetCurrTemp           ' show current temperature
+        LogMyMsg msg, true
+        document.GetElementByID("imgTimeTimer").style.visibility = "hidden"
+    end sub
+
+    sub CheckManual_Timer
+        ' timer callback for manual control
+        document.GetElementByID("imgManualTimer").style.visibility = "visible"
+        theTemp = GetCurrTemp           ' show current temperature
+        document.GetElementByID("imgManualTimer").style.visibility = "hidden"
+    end sub
+
+    sub tempControlModeActivate (onoff)
+        if(onoff) then
+            ' enable the temperature control mode
+            tempTimerID = window.setInterval("CheckTemp_Timer", CLng(document.GetElementByID("txtTimer").Value))
+            controlMode = MODE_TEMP
+            document.GetElementByID("txtTimer").disabled = false
+            document.GetElementByID("txtUpperTemp").disabled = false
+            document.GetElementByID("txtLowerTemp").disabled = false
+            document.GetElementByID("TempMode").style.background = ACTIVE_COLOR
+            CheckTemp_Timer
+            
+        else
+            ' Disable temperature control mode
+            window.clearInterval(tempTimerID)
+            document.GetElementByID("txtTimer").disabled = true
+            document.GetElementByID("txtUpperTemp").disabled = true
+            document.GetElementByID("txtLowerTemp").disabled = true
+            document.GetElementByID("TempMode").style.background = INACTIVE_COLOR
+        end if
+    end sub
+
+    sub timeControlModeActivate (onoff)
+        if(onoff) then
+            ' enable the temperature control mode
+            timeTimerID = window.setInterval("CheckTime_Timer", CLng(TIME_MODE_INTERVAL))     ' check every minute
+            controlMode = MODE_TIME
+            document.GetElementByID("txtTimeOn").disabled = false
+            document.GetElementByID("txtTimeOff").disabled = false
+            document.GetElementByID("TimeMode").style.background = ACTIVE_COLOR
+            CheckTime_Timer
+        else
+            ' Disable temperature control mode
+            window.clearInterval(timeTimerID)
+            document.GetElementByID("txtTimeOn").disabled = true
+            document.GetElementByID("txtTimeOff").disabled = true
+            document.GetElementByID("TimeMode").style.background = INACTIVE_COLOR
+        end if
+    end sub
+
+    sub turnAC (turnon)
+        SetACPower (turnon)
+        if (turnon) then
+            LogMyMsg Date & " " & Time & ": manually turned AC on", False
+        else
+            LogMyMsg Date & " " & Time & ": manually turned AC off", false
+        end if
+    end sub
+
+    sub manualControlModeActivate (onoff)
+        ' visibility = "hidden" or "visible"
+        if(onoff) then
+            ' enable Manual mode
+            manualTimerID = window.setInterval("CheckManual_Timer", CLng(MANUAL_MODE_INTERVAL))     ' check every minute
+            document.GetElementByID("btnManualOn").disabled = false
+            document.GetElementByID("btnManualOff").disabled = false
+            document.GetElementByID("ManualMode").style.background = ACTIVE_COLOR
+            controlMode = MODE_MANUAL
+            CheckManual_Timer
+        else
+            ' Disable manual mode
+            window.clearInterval(manualTimerID)
+            document.GetElementByID("btnManualOn").disabled = true
+            document.GetElementByID("btnManualOff").disabled = true
+            document.GetElementByID("ManualMode").style.background = INACTIVE_COLOR
+        end if
+    end sub
+
+    ' Callback functions for operational modes
+    sub tempControlMode_OnClick
+        timeControlModeActivate (False)
+        manualControlModeActivate (False)
+        tempControlModeActivate (True)
+    end sub
+
+    sub timeControlMode_OnClick
+        manualControlModeActivate (False)
+        tempControlModeActivate (False)
+        timeControlModeActivate (True)
+    end sub
+
+    sub manualMode_OnClick
+        timeControlModeActivate (False)
+        tempControlModeActivate (False)
+        manualControlModeActivate (True)
+        
+    end sub
+
+    sub LogMyMsg (s, printIt)
+        if (printIt) then
+            'LogMsg.InnerHTML = logmsg.innerHTML & "<br>" & s
+            logFile.WriteLine(s)
+        end if
+    end sub
+
+' Sleep function from internet
+Sub Sleep(MSecs) 
+    Set fso = CreateObject("Scripting.FileSystemObject")
+    If Fso.FileExists("sleeper.vbs")=False Then
+        Set objOutputFile = fso.CreateTextFile("sleeper.vbs", True)
+        objOutputFile.Write "wscript.sleep WScript.Arguments(0)"
+        objOutputFile.Close
+    End If
+
+    CreateObject("WScript.Shell").Run "sleeper.vbs " & MSecs,1 , True
+End Sub
+
+</SCRIPT>
+
+<body>
+<center><span style="font-size: large">Air Conditioning Controller</span></center>
+
+<form>
+<table width="100%">
+<colgroup>
+    <col style="width="33%">
+    <col style="width="33%">
+    <col style="width="33%">
+</colgroup>
+
+<tr>
+<td id="TempMode" valign="top" info="1st col">
+<table style="width: 100%;">
+<tr>
+<td><input type="button" name="btnTempControl" value="Control Mode" onclick="tempControlMode_OnClick" style="background: red;width: 100%;" /></td>
+<td><img src="TempTimer.png" id="imgTempTimer"  /></td>
+</tr>
+<tr>
+<td>Timer Interval (msec)</td>
+<td><input type="text" value="120000" name="txtTimer" size="10" ></td>
+</tr>
+<tr>
+<td>Upper Temperature (starts cooling)</td>
+<td><input type="text" value="87" name="txtUpperTemp" size="10" ></td>
+</tr>
+<tr>
+<td>Lower Temperature (stops cooling)</td>
+<td><input type="text" value="85" name="txtLowerTemp" size="10" ></td>
+</tr>
+</table>
+</td info="end 1st col">
+
+<td id="TimeMode"  valign="top" info="Second column">
+<table style="width: 100%;">
+<tr>
+<td><input type="button" name="btnTimeControl" value="Timer Mode" onclick="timeControlMode_OnClick" style="background: yellow;width: 100%;"/></td>
+<td><img src="TimeTimer.png" id="imgTimeTimer"  /></td>
+</tr>
+<tr>
+<td>Turn On Time</td>
+<td><input type="text" value="11:00:00" name="txtTimeOn" size="10" ></td>
+</tr>
+<tr>
+<td>Turn Off Time</td>
+<td><input type="text" value="20:00:00" name="txtTimeOff" size="10" ></td>
+</tr>
+<tr>
+<td>Current Time</td>
+<td><span id="currentTime"></span></td>
+</tr></table>
+</td info="end sec col">
+
+<td id="ManualMode"  valign="top" info="third column">
+<table style="width: 100%;">
+<tr>
+<td><input type="button" name="btnManualControl" value="Manual Mode" onclick="manualMode_OnClick" style="background: green;width: 100%;"/></td>
+<td><img src="ManualTimer.png" id="imgManualTimer"  /></td>
+</tr>
+<tr><td><input type="button" name="btnManualOn" value="Turn On AC" onclick="turnAC(True)" style="background: lightgreen;width: 100%;"/></td></tr>
+<tr><td><input type="button" name="btnManualOff" value="Turn Off AC" onclick="turnAC(False)" style="background: pink;width: 100%;"/></td></tr>
+</table>
+</td info="end 3rd col">
+</tr>
+</table info="End Big Table">
+</form>
+<p />
+ <span id="StatusLight"></span> Current Temperature:  <span id="currentTemp" style="font-size: large"></span><br>
+<span id="LogMsg"></span><br>
+
+
+</body>
+</html>
